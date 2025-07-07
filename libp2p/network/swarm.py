@@ -1,3 +1,5 @@
+from libp2p.transport.quic.connection import QUICConnection
+from typing import cast
 import logging
 import sys
 
@@ -275,6 +277,17 @@ class Swarm(Service, INetworkService):
             ) -> None:
                 raw_conn = RawConnection(read_write_closer, False)
 
+                # No need to upgrade QUIC Connection
+                if isinstance(self.transport, QUICTransport):
+                    print("Connecting QUIC Connection")
+                    quic_conn = cast(QUICConnection, raw_conn)
+                    await self.add_conn(quic_conn)
+                    # NOTE: This is a intentional barrier to prevent from the handler
+                    # exiting and closing the connection.
+                    await self.manager.wait_finished()
+                    print("Connection Connected")
+                    return
+
                 # Per, https://discuss.libp2p.io/t/multistream-security/130, we first
                 # secure the conn and then mux the conn
                 try:
@@ -381,6 +394,7 @@ class Swarm(Service, INetworkService):
             muxed_conn,
             self,
         )
+        print("add_conn called")
 
         self.manager.run_task(muxed_conn.start)
         await muxed_conn.event_started.wait()
