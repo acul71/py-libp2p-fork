@@ -1,7 +1,6 @@
-from libp2p.transport.quic.connection import QUICConnection
-from typing import cast
 import logging
 import sys
+from typing import cast
 
 from multiaddr import (
     Multiaddr,
@@ -38,6 +37,7 @@ from libp2p.transport.exceptions import (
     OpenConnectionError,
     SecurityUpgradeFailure,
 )
+from libp2p.transport.quic.connection import QUICConnection
 from libp2p.transport.quic.transport import QUICTransport
 from libp2p.transport.upgrader import (
     TransportUpgrader,
@@ -279,7 +279,6 @@ class Swarm(Service, INetworkService):
 
                 # No need to upgrade QUIC Connection
                 if isinstance(self.transport, QUICTransport):
-                    print("Connecting QUIC Connection")
                     quic_conn = cast(QUICConnection, raw_conn)
                     await self.add_conn(quic_conn)
                     # NOTE: This is a intentional barrier to prevent from the handler
@@ -395,7 +394,6 @@ class Swarm(Service, INetworkService):
             self,
         )
         print("add_conn called")
-
         self.manager.run_task(muxed_conn.start)
         await muxed_conn.event_started.wait()
         self.manager.run_task(swarm_conn.start)
