@@ -213,13 +213,14 @@ class BasicHost(IHost):
         self,
         peer_id: ID,
         protocol_ids: Sequence[TProtocol],
+        context: dict | None = None,
     ) -> INetStream:
         """
         :param peer_id: peer_id that host is connecting
         :param protocol_ids: available protocol ids to use for stream
         :return: stream: new stream created
         """
-        net_stream = await self._network.new_stream(peer_id)
+        net_stream = await self._network.new_stream(peer_id, context=context)
 
         # Perform protocol muxing to determine protocol to use
         try:
