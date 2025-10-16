@@ -44,7 +44,6 @@ from .pb.circuit_pb2 import (
 )
 from .protocol import (
     PROTOCOL_ID,
-    STREAM_READ_TIMEOUT,
     CircuitV2Protocol,
 )
 from .protocol_buffer import (
@@ -117,16 +116,83 @@ class CircuitV2Transport(ITransport):
             If the connection cannot be established
 
         """
-        # Extract peer ID from multiaddr - P_P2P code is 0x01A5 (421)
-        peer_id_str = maddr.value_for_protocol("p2p")
-        if not peer_id_str:
-            raise ConnectionError("Multiaddr does not contain peer ID")
+        # For circuit addresses, extract both relay and destination peer IDs
+        # Circuit address format: /p2p/{relay_peer_id}/p2p-circuit/p2p/{dest_peer_id}
+        protocols = [proto.name for proto in maddr.protocols()]
+        if "p2p-circuit" in protocols:
+            # Extract destination peer ID (the last p2p component)
+            logger.debug("dial method: multiaddr=%s", maddr)
+            logger.debug(
+                "dial method: multiaddr protocols=%s",
+                [proto.name for proto in maddr.protocols()],
+            )
 
-        peer_id = ID.from_base58(peer_id_str)
-        peer_info = PeerInfo(peer_id, [maddr])
+            # For circuit addresses, we need to extract the destination peer ID
+            # from the end
+            # Circuit address format:
+            # /p2p/{relay_peer_id}/p2p-circuit/p2p/{dest_peer_id}
+            # The destination peer ID is the last /p2p/ component
+            maddr_str = str(maddr)
+            if "/p2p-circuit/p2p/" in maddr_str:
+                # Find the destination peer ID after /p2p-circuit/p2p/
+                dest_start = maddr_str.find("/p2p-circuit/p2p/") + len(
+                    "/p2p-circuit/p2p/"
+                )
+                dest_peer_id_str = maddr_str[dest_start:]
+                logger.debug("dial method: dest_peer_id_str=%s", dest_peer_id_str)
+            else:
+                # Fallback to the old method
+                dest_peer_id_str = maddr.value_for_protocol("p2p")
+                logger.debug("dial method: dest_peer_id_str=%s", dest_peer_id_str)
 
-        # Use the internal dial_peer_info method
-        return await self.dial_peer_info(peer_info)
+            if not dest_peer_id_str:
+                raise ConnectionError(
+                    "Circuit address does not contain destination peer ID"
+                )
+
+            dest_peer_id = ID.from_base58(dest_peer_id_str)
+
+            # Extract relay peer ID (the first p2p component before p2p-circuit)
+            # Parse the multiaddr string to extract the relay peer ID
+            relay_peer_id = None
+            maddr_str = str(maddr)
+            # Circuit address format:
+            # /p2p/{relay_peer_id}/p2p-circuit/p2p/{dest_peer_id}
+            # We need to extract the relay peer ID from the first /p2p/ component
+            if "/p2p/" in maddr_str and "/p2p-circuit/" in maddr_str:
+                # Find the first /p2p/ component
+                p2p_start = maddr_str.find("/p2p/")
+                if p2p_start != -1:
+                    # Find the end of the first /p2p/ component
+                    p2p_end = maddr_str.find("/", p2p_start + 5)
+                    if p2p_end != -1:
+                        relay_peer_id_str = maddr_str[p2p_start + 5 : p2p_end]
+                        relay_peer_id = ID.from_base58(relay_peer_id_str)
+
+            if not relay_peer_id:
+                raise ConnectionError("Circuit address does not contain relay peer ID")
+
+            logger.debug(
+                "dial method: dest_peer_id=%s, relay_peer_id=%s",
+                dest_peer_id,
+                relay_peer_id,
+            )
+            peer_info = PeerInfo(dest_peer_id, [maddr])
+            logger.debug(
+                "dial method: created peer_info with peer_id=%s", peer_info.peer_id
+            )
+            return await self.dial_peer_info(peer_info, relay_peer_id=relay_peer_id)
+        else:
+            # Regular multiaddr handling
+            peer_id_str = maddr.value_for_protocol("p2p")
+            if not peer_id_str:
+                raise ConnectionError("Multiaddr does not contain peer ID")
+
+            peer_id = ID.from_base58(peer_id_str)
+            peer_info = PeerInfo(peer_id, [maddr])
+
+            # Use the internal dial_peer_info method
+            return await self.dial_peer_info(peer_info)
 
     async def dial_peer_info(
         self,
@@ -164,6 +230,11 @@ class CircuitV2Transport(ITransport):
         # Get a stream to the relay
         try:
             logger.debug(
+                "dial_peer_info called with peer_info.peer_id=%s, relay_peer_id=%s",
+                peer_info.peer_id,
+                relay_peer_id,
+            )
+            logger.debug(
                 "Opening stream to relay %s with protocol %s",
                 relay_peer_id,
                 PROTOCOL_ID,
@@ -179,26 +250,42 @@ class CircuitV2Transport(ITransport):
             )
 
         try:
-            # First try to make a reservation if enabled
+            # First try to make a reservation if enabled (on separate stream)
             if self.config.enable_client:
-                success = await self._make_reservation(relay_stream, relay_peer_id)
+                success = await self._make_reservation(relay_peer_id)
                 if not success:
                     logger.warning(
                         "Failed to make reservation with relay %s", relay_peer_id
                     )
 
+            # Use the existing stream for CONNECT instead of opening a new one
+            connect_stream = relay_stream
+            logger.debug("Using existing stream for CONNECT to relay %s", relay_peer_id)
+
             # Send HOP CONNECT message
+            logger.debug(
+                "Sending CONNECT message with destination peer ID: %s",
+                peer_info.peer_id,
+            )
+            logger.debug(
+                "Raw peer bytes being sent: %s", peer_info.peer_id.to_bytes().hex()
+            )
             hop_msg = HopMessage(
                 type=HopMessage.CONNECT,
                 peer=peer_info.peer_id.to_bytes(),
             )
-            await relay_stream.write(hop_msg.SerializeToString())
+            await connect_stream.write(hop_msg.SerializeToString())
 
-            # Read response with timeout
-            with trio.fail_after(STREAM_READ_TIMEOUT):
-                resp_bytes = await relay_stream.read()
+            # Read response with timeout using the protocol's retry mechanism
+            try:
+                resp_bytes = await self.protocol._read_stream_with_retry(connect_stream)
+                if not resp_bytes:
+                    raise ConnectionError("Stream closed by relay")
                 resp = HopMessage()
                 resp.ParseFromString(resp_bytes)
+            except Exception as e:
+                logger.error("Error reading CONNECT response from relay: %s", str(e))
+                raise ConnectionError(f"Failed to read CONNECT response: {str(e)}")
 
             # Access status attributes directly
             status_code = getattr(resp.status, "code", StatusCode.OK)
@@ -208,7 +295,7 @@ class CircuitV2Transport(ITransport):
                 raise ConnectionError(f"Relay connection failed: {status_msg}")
 
             # Create raw connection from stream
-            return RawConnection(stream=relay_stream, initiator=True)
+            return RawConnection(stream=connect_stream, initiator=True)
 
         except Exception as e:
             await relay_stream.close()
@@ -247,7 +334,6 @@ class CircuitV2Transport(ITransport):
 
     async def _make_reservation(
         self,
-        stream: INetStream,
         relay_peer_id: ID,
     ) -> bool:
         """
@@ -255,8 +341,6 @@ class CircuitV2Transport(ITransport):
 
         Parameters
         ----------
-        stream : INetStream
-            Stream to the relay
         relay_peer_id : ID
             The relay's peer ID
 
@@ -266,15 +350,23 @@ class CircuitV2Transport(ITransport):
             True if reservation was successful
 
         """
+        stream = None
         try:
+            # Open a stream to the relay for reservation
+            logger.debug("Opening stream for reservation to relay %s", relay_peer_id)
+            stream = await self.host.new_stream(relay_peer_id, [PROTOCOL_ID])
+            if not stream:
+                logger.error("Failed to open stream to relay %s", relay_peer_id)
+                return False
+
             # Send reservation request
             reserve_msg = HopMessage(
                 type=HopMessage.RESERVE,
-                peer=self.host.get_id().to_bytes(),
+                peer=self.host.get_peer_id().to_bytes(),
             )
             logger.debug("=== SENDING RESERVATION REQUEST ===")
             logger.debug("Message type: %s", reserve_msg.type)
-            logger.debug("Peer ID: %s", self.host.get_id())
+            logger.debug("Peer ID: %s", self.host.get_peer_id())
             logger.debug("Raw message: %s", reserve_msg)
 
             try:
@@ -284,30 +376,25 @@ class CircuitV2Transport(ITransport):
                 logger.error("Failed to send reservation request: %s", str(e))
                 raise
 
-            # Read response with timeout
+            # Read response with timeout using the protocol's retry mechanism
             logger.debug("=== WAITING FOR RESERVATION RESPONSE ===")
-            with trio.fail_after(STREAM_READ_TIMEOUT):
-                try:
-                    resp_bytes = await stream.read()
-                    logger.debug(
-                        "Received reservation response: %d bytes", len(resp_bytes)
-                    )
-                    resp = HopMessage()
-                    resp.ParseFromString(resp_bytes)
-                    logger.debug("=== PARSED RESERVATION RESPONSE ===")
-                    logger.debug("Message type: %s", resp.type)
-                    logger.debug(
-                        "Status code: %s", getattr(resp.status, "code", "unknown")
-                    )
-                    logger.debug(
-                        "Status message: %s", getattr(resp.status, "message", "unknown")
-                    )
-                    logger.debug("Raw response: %s", resp)
-                except Exception as e:
-                    logger.error(
-                        "Failed to read/parse reservation response: %s", str(e)
-                    )
-                    raise
+            try:
+                resp_bytes = await self.protocol._read_stream_with_retry(stream)
+                if not resp_bytes:
+                    raise ConnectionError("Stream closed by relay during reservation")
+                logger.debug("Received reservation response: %d bytes", len(resp_bytes))
+                resp = HopMessage()
+                resp.ParseFromString(resp_bytes)
+                logger.debug("=== PARSED RESERVATION RESPONSE ===")
+                logger.debug("Message type: %s", resp.type)
+                logger.debug("Status code: %s", getattr(resp.status, "code", "unknown"))
+                logger.debug(
+                    "Status message: %s", getattr(resp.status, "message", "unknown")
+                )
+                logger.debug("Raw response: %s", resp)
+            except Exception as e:
+                logger.error("Failed to read/parse reservation response: %s", str(e))
+                raise
 
             # Access status attributes directly
             status_code = getattr(resp.status, "code", StatusCode.OK)
@@ -332,6 +419,13 @@ class CircuitV2Transport(ITransport):
         except Exception as e:
             logger.error("Error making reservation: %s", str(e))
             return False
+        finally:
+            # Don't close the stream here - we want to reuse it for CONNECT
+            # The stream will be closed by the caller
+            pass
+
+        # This should never be reached, but satisfies type checker
+        return False
 
     def create_listener(
         self,
@@ -383,6 +477,7 @@ class CircuitV2Listener(Service, IListener):
         self.multiaddrs: list[
             multiaddr.Multiaddr
         ] = []  # Store multiaddrs as Multiaddr objects
+        self._incoming_receive: trio.MemoryReceiveChannel | None = None
 
     async def handle_incoming_connection(
         self,
@@ -414,8 +509,11 @@ class CircuitV2Listener(Service, IListener):
             raise ConnectionError("Stop role is not enabled")
 
         try:
-            # Read STOP message
-            msg_bytes = await stream.read()
+            # Read STOP message with max size
+            # Max size for Circuit Relay v2 messages
+            msg_bytes = await stream.read(4096)
+            if not msg_bytes:
+                raise ConnectionError("No data received from stream")
             stop_msg = StopMessage()
             stop_msg.ParseFromString(msg_bytes)
 
@@ -431,7 +529,9 @@ class CircuitV2Listener(Service, IListener):
 
     async def run(self) -> None:
         """Run the listener service."""
-        # Implementation would go here
+        # Set up the incoming connections channel
+        self._incoming_receive = self.protocol.setup_incoming_channel()
+        logger.debug("Circuit Relay v2 listener started")
 
     async def listen(self, maddr: multiaddr.Multiaddr, nursery: trio.Nursery) -> bool:
         """
@@ -470,6 +570,36 @@ class CircuitV2Listener(Service, IListener):
 
         """
         return tuple(self.multiaddrs)
+
+    async def accept(self) -> tuple[RawConnection, PeerInfo]:
+        """
+        Accept an incoming relay connection.
+
+        Returns
+        -------
+        tuple[RawConnection, PeerInfo]
+            The accepted connection and peer info
+
+        Raises
+        ------
+        ConnectionError
+            If no connection is available or listener is closed
+
+        """
+        if self._incoming_receive is None:
+            raise ConnectionError("Listener not started")
+
+        try:
+            # Wait for an incoming connection from the channel
+            raw_conn, peer_info = await self._incoming_receive.receive()
+            logger.debug(
+                "Accepted Circuit Relay v2 connection from %s", peer_info.peer_id
+            )
+            return raw_conn, peer_info
+        except trio.EndOfChannel:
+            raise ConnectionError("Listener closed")
+        except Exception as e:
+            raise ConnectionError(f"Failed to accept connection: {str(e)}")
 
     async def close(self) -> None:
         """Close the listener."""

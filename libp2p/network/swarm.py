@@ -1,6 +1,7 @@
 from collections.abc import (
     Awaitable,
     Callable,
+    Sequence,
 )
 import logging
 import random
@@ -23,6 +24,7 @@ from libp2p.abc import (
 )
 from libp2p.custom_types import (
     StreamHandlerFn,
+    TProtocol,
 )
 from libp2p.io.abc import (
     ReadWriteCloser,
@@ -322,16 +324,72 @@ class Swarm(Service, INetworkService):
         :raises SwarmException: raised when an error occurs
         :return: network connection
         """
-        # Dial peer (connection to peer does not yet exist)
-        # Transport dials peer (gets back a raw conn)
-        try:
-            addr = Multiaddr(f"{addr}/p2p/{peer_id}")
-            raw_conn = await self.transport.dial(addr)
-        except OpenConnectionError as error:
-            logger.debug("fail to dial peer %s over base transport", peer_id)
-            raise SwarmException(
-                f"fail to open connection to peer {peer_id}"
-            ) from error
+        # Check if this is a circuit address
+        protocols = [proto.name for proto in addr.protocols()]
+        if "p2p-circuit" in protocols:
+            logger.debug("Detected circuit address, using Circuit Relay v2 transport")
+            try:
+                # Import Circuit Relay v2 transport
+                from libp2p.relay.circuit_v2.config import RelayConfig, RelayRole
+                from libp2p.relay.circuit_v2.protocol import CircuitV2Protocol
+                from libp2p.relay.circuit_v2.transport import CircuitV2Transport
+
+                # Create Circuit Relay v2 protocol and transport
+                relay_config = RelayConfig(roles=RelayRole.CLIENT)
+                protocol = CircuitV2Protocol(host=self, allow_hop=False)
+                circuit_transport = CircuitV2Transport(
+                    host=self, protocol=protocol, config=relay_config
+                )
+
+                # Use circuit transport to dial
+                raw_conn = await circuit_transport.dial(addr)
+                logger.debug(
+                    "Successfully dialed circuit address using "
+                    "Circuit Relay v2 transport"
+                )
+
+                # Circuit Relay v2 returns a RawConnection that is already
+                # a stream over the relay protocol. We need to create a SwarmConn
+                # from it so that the host can create streams on it.
+                from libp2p.network.connection.swarm_connection import SwarmConn
+                from libp2p.stream_muxer.yamux.yamux import Yamux
+
+                # Create a muxed connection from the raw connection
+                muxed_conn = Yamux(raw_conn, peer_id)
+                # Mark Circuit Relay v2 connections as limited
+                swarm_conn = SwarmConn(muxed_conn, self, limited=True)
+
+                # Store it in the connections dictionary
+                if peer_id not in self.connections:
+                    self.connections[peer_id] = []
+                self.connections[peer_id].append(swarm_conn)
+
+                # Start the SwarmConn to handle incoming streams
+                import trio
+
+                nursery = trio.lowlevel.current_task().parent_nursery
+                nursery.start_soon(swarm_conn.start)
+
+                return swarm_conn
+            except Exception as error:
+                logger.debug(
+                    "Failed to dial circuit address with Circuit Relay v2 "
+                    "transport: %s",
+                    error,
+                )
+                raise SwarmException(
+                    f"Failed to dial circuit address {addr}: {error}"
+                ) from error
+        else:
+            # Use default transport for non-circuit addresses
+            try:
+                addr = Multiaddr(f"{addr}/p2p/{peer_id}")
+                raw_conn = await self.transport.dial(addr)
+            except OpenConnectionError as error:
+                logger.debug("fail to dial peer %s over base transport", peer_id)
+                raise SwarmException(
+                    f"fail to open connection to peer {peer_id}"
+                ) from error
 
         if isinstance(self.transport, QUICTransport) and isinstance(
             raw_conn, IMuxedConn
@@ -381,7 +439,12 @@ class Swarm(Service, INetworkService):
         """
         return await self._dial_with_retry(addr, peer_id)
 
-    async def new_stream(self, peer_id: ID) -> INetStream:
+    async def new_stream(
+        self,
+        peer_id: ID,
+        protocol_ids: Sequence[TProtocol] | None = None,
+        context: dict | None = None,
+    ) -> INetStream:
         """
         Enhanced: Create a new stream with load balancing across multiple connections.
 
@@ -398,6 +461,29 @@ class Swarm(Service, INetworkService):
         # Load balancing strategy at interface level
         connection = self._select_connection(connections, peer_id)
 
+        # Check if connection is limited and if limited connections are allowed
+        if connection and hasattr(connection, "limited") and connection.limited:
+            from libp2p.network.context import get_allow_limited_conn
+
+            limited_allowed, reason = get_allow_limited_conn(context)
+            if not limited_allowed:
+                logger.debug("Limited connection not allowed for peer %s", peer_id)
+                # Try to get a direct connection instead
+                direct_connections = [
+                    conn
+                    for conn in connections
+                    if not (hasattr(conn, "limited") and conn.limited)
+                ]
+                if direct_connections:
+                    connection = self._select_connection(direct_connections, peer_id)
+                else:
+                    # No direct connections available, raise an error
+                    from libp2p.network.exceptions import SwarmException
+
+                    raise SwarmException(
+                        f"Limited connection not allowed and no direct connection available to peer {peer_id}"
+                    )
+
         if isinstance(self.transport, QUICTransport) and connection is not None:
             conn = cast(SwarmConn, connection)
             return await conn.new_stream()
@@ -405,6 +491,40 @@ class Swarm(Service, INetworkService):
         try:
             net_stream = await connection.new_stream()
             logger.debug("successfully opened a stream to peer %s", peer_id)
+
+            # Perform protocol negotiation if protocol_ids are provided
+            if protocol_ids:
+                from libp2p.host.exceptions import StreamFailure
+                from libp2p.protocol_muxer.exceptions import MultiselectClientError
+                from libp2p.protocol_muxer.multiselect_client import MultiselectClient
+                from libp2p.protocol_muxer.multiselect_communicator import (
+                    MultiselectCommunicator,
+                )
+
+                try:
+                    multiselect_client = MultiselectClient()
+                    selected_protocol = await multiselect_client.select_one_of(
+                        list(protocol_ids),
+                        MultiselectCommunicator(net_stream),
+                        5,  # Default timeout
+                    )
+                    net_stream.set_protocol(selected_protocol)
+                    logger.debug(
+                        "successfully negotiated protocol %s for peer %s",
+                        selected_protocol,
+                        peer_id,
+                    )
+                except MultiselectClientError as error:
+                    logger.debug(
+                        "fail to negotiate protocol for peer %s, error=%s",
+                        peer_id,
+                        error,
+                    )
+                    await net_stream.reset()
+                    raise StreamFailure(
+                        f"failed to negotiate protocol for peer {peer_id}"
+                    ) from error
+
             return net_stream
         except Exception as e:
             logger.debug(f"Failed to create stream on connection: {e}")

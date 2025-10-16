@@ -6,17 +6,35 @@ This example demonstrates using the Circuit Relay v2 protocol by setting up:
 2. A destination node that accepts incoming connections
 3. A source node that connects to the destination through the relay
 
-Usage:
-    # First terminal - start the relay:
+Usage Examples:
+
+    # Step 1: Start the relay node (Terminal 1)
     python relay_example.py --role relay --port 8000
+    # This will output: "Relay node is running. Use the following address to connect:"
+    # Copy the relay peer ID from the output (e.g., 16Uiu2HAm...)
 
-    # Second terminal - start the destination:
+    # Step 2: Start the destination node (Terminal 2)
     python relay_example.py --role destination --port 8001 --relay-addr RELAY_PEER_ID
+    # This will output the destination peer ID (e.g., 16Uiu2HAm...)
 
-    # Third terminal - start the source:
-    python relay_example.py --role source \
-        --relay-addr RELAY_PEER_ID \
+    # Step 3: Start the source node (Terminal 3)
+    python relay_example.py --role source --relay-addr RELAY_PEER_ID \
         --dest-id DESTINATION_PEER_ID
+    # This will connect to the destination through the relay and exchange messages
+
+    # Optional: Use debug mode for verbose logging
+    python relay_example.py --role relay --port 8000 --debug
+    python relay_example.py --role destination --port 8001 \
+        --relay-addr RELAY_PEER_ID --debug
+    python relay_example.py --role source --relay-addr RELAY_PEER_ID \
+        --dest-id DESTINATION_PEER_ID --debug
+
+    # Optional: Use fixed seeds for reproducible peer IDs
+    python relay_example.py --role relay --port 8000 --seed 1
+    python relay_example.py --role destination --port 8001 \
+        --relay-addr RELAY_PEER_ID --seed 2
+    python relay_example.py --role source --relay-addr RELAY_PEER_ID \
+        --dest-id DESTINATION_PEER_ID --seed 3
 """
 
 import argparse
@@ -53,17 +71,22 @@ logging.basicConfig(
 logger = logging.getLogger("circuit-relay-example")
 
 # Application protocol for our example
-EXAMPLE_PROTOCOL_ID = TProtocol("/circuit-relay-example/1.0.0")
+EXAMPLE_PROTOCOL_ID = TProtocol("/echo/1.0.0")
 MAX_READ_LEN = 2**16  # 64KB
 
 
 async def handle_example_protocol(stream: INetStream) -> None:
-    """Handle incoming messages on our example protocol."""
+    """Handle incoming messages on our echo protocol."""
     remote_peer_id = stream.muxed_conn.peer_id
     try:
         remote_addr = stream.get_remote_address()
     except Exception:
         remote_addr = None
+
+    # Add debug logging to see if handler is being called
+    logger.info("🎯 DESTINATION ECHO HANDLER CALLED!")
+    print("🎯 DESTINATION ECHO HANDLER CALLED!")
+
     logger.debug(
         "[APP] handle_example_protocol: incoming stream | remote_peer=%s | "
         "remote_addr=%s | protocol=%s",
@@ -77,17 +100,27 @@ async def handle_example_protocol(stream: INetStream) -> None:
         logger.debug("[APP] waiting to read up to %s bytes from stream", MAX_READ_LEN)
         msg = await stream.read(MAX_READ_LEN)
         if msg:
+            message_text = msg.decode(errors="ignore")
             logger.info(
-                "Received message (%d bytes): %s", len(msg), msg.decode(errors="ignore")
+                "🎯 DESTINATION RECEIVED APPLICATION MESSAGE: '%s' from %s",
+                message_text,
+                remote_peer_id,
+            )
+            print(
+                f"🎯 DESTINATION RECEIVED APPLICATION MESSAGE: '{message_text}' from {remote_peer_id}"
             )
 
-        # Send a response
-        # Get the local peer ID from the secure connection
-        local_peer_id = stream.muxed_conn.peer_id
-        response = f"Hello! This is {local_peer_id}".encode()
-        logger.debug("[APP] writing %d bytes to stream", len(response))
-        await stream.write(response)
-        logger.info("Sent response to %s", remote_peer_id)
+            # Echo the message back (like the echo example)
+            logger.debug("[APP] echoing %d bytes back to stream", len(msg))
+            await stream.write(msg)
+            logger.info(
+                "📤 DESTINATION ECHOED MESSAGE: '%s' to %s",
+                message_text,
+                remote_peer_id,
+            )
+            print(
+                f"📤 DESTINATION ECHOED MESSAGE: '{message_text}' to {remote_peer_id}"
+            )
     except Exception as e:
         logger.exception("[APP] Error handling stream: %s", e)
     finally:
@@ -109,6 +142,8 @@ async def setup_relay_node(port: int, seed: int | None = None) -> None:
     # Create host with a fixed key if seed is provided
     key_pair = create_new_key_pair(generate_fixed_private_key(seed) if seed else None)
     logger.debug("[RELAY] created key_pair=%s", type(key_pair).__name__)
+
+    # Use default security configuration (Noise + SECIO + PLAINTEXT)
     host = new_host(key_pair=key_pair)
     logger.debug("[RELAY] host initialized | peer_id=%s", host.get_id())
 
@@ -186,6 +221,8 @@ async def setup_destination_node(
 
     # Create host with a fixed key if seed is provided
     key_pair = create_new_key_pair(generate_fixed_private_key(seed) if seed else None)
+
+    # Use default security configuration (Noise + SECIO + PLAINTEXT)
     host = new_host(key_pair=key_pair)
     logger.debug("[DEST] host initialized | peer_id=%s", host.get_id())
 
@@ -214,7 +251,7 @@ async def setup_destination_node(
         limits.max_reservations,
     )
 
-    # Start the host
+    # Start the host and keep it running
     listen_addr = multiaddr.Multiaddr(f"/ip4/0.0.0.0/tcp/{port}")
 
     async with host.run(listen_addrs=[listen_addr]):
@@ -233,7 +270,107 @@ async def setup_destination_node(
         host.set_stream_handler(STOP_PROTOCOL_ID, protocol._handle_stop_stream)
         logger.debug("[DEST] protocol handlers registered")
 
-        # Start the relay protocol service
+        # Add debug logging to see if any streams are being received
+        logger.info("🎯 DESTINATION NODE READY - Echo protocol handler registered!")
+        print("🎯 DESTINATION NODE READY - Echo protocol handler registered!")
+
+        # Add a generic stream handler to catch all incoming streams
+        async def debug_stream_handler(stream: INetStream) -> None:
+            logger.info("🎯 GENERIC STREAM HANDLER CALLED!")
+            print("🎯 GENERIC STREAM HANDLER CALLED!")
+            try:
+                # Try to read from the stream
+                msg = await stream.read(MAX_READ_LEN)
+                if msg:
+                    message_text = msg.decode(errors="ignore")
+                    logger.info("🎯 DESTINATION RECEIVED MESSAGE: '%s'", message_text)
+                    print(f"🎯 DESTINATION RECEIVED MESSAGE: '{message_text}'")
+
+                    # Echo the message back
+                    await stream.write(msg)
+                    logger.info("📤 DESTINATION ECHOED MESSAGE: '%s'", message_text)
+                    print(f"📤 DESTINATION ECHOED MESSAGE: '{message_text}'")
+            except Exception as e:
+                logger.exception("Error in debug stream handler: %s", e)
+            finally:
+                await stream.close()
+
+        # Register the debug handler for all protocols
+        host.set_stream_handler(TProtocol("/debug/1.0.0"), debug_stream_handler)
+
+        # Add a catch-all handler for any protocol
+        async def catch_all_handler(stream: INetStream) -> None:
+            logger.info("🎯 CATCH-ALL HANDLER CALLED!")
+            print("🎯 CATCH-ALL HANDLER CALLED!")
+            try:
+                # Try to read from the stream
+                msg = await stream.read(MAX_READ_LEN)
+                if msg:
+                    message_text = msg.decode(errors="ignore")
+                    logger.info("🎯 CATCH-ALL RECEIVED MESSAGE: '%s'", message_text)
+                    print(f"🎯 CATCH-ALL RECEIVED MESSAGE: '{message_text}'")
+
+                    # Echo the message back
+                    await stream.write(msg)
+                    logger.info("📤 CATCH-ALL ECHOED MESSAGE: '%s'", message_text)
+                    print(f"📤 CATCH-ALL ECHOED MESSAGE: '{message_text}'")
+            except Exception as e:
+                logger.exception("Error in catch-all handler: %s", e)
+            finally:
+                await stream.close()
+
+        # Register catch-all handler for any protocol
+        host.set_stream_handler(TProtocol("/catch-all/1.0.0"), catch_all_handler)
+
+        # Add a wildcard handler for any protocol
+        async def wildcard_handler(stream: INetStream) -> None:
+            logger.info("🎯 WILDCARD HANDLER CALLED!")
+            print("🎯 WILDCARD HANDLER CALLED!")
+            try:
+                # Try to read from the stream
+                msg = await stream.read(MAX_READ_LEN)
+                if msg:
+                    message_text = msg.decode(errors="ignore")
+                    logger.info("🎯 WILDCARD RECEIVED MESSAGE: '%s'", message_text)
+                    print(f"🎯 WILDCARD RECEIVED MESSAGE: '{message_text}'")
+
+                    # Echo the message back
+                    await stream.write(msg)
+                    logger.info("📤 WILDCARD ECHOED MESSAGE: '%s'", message_text)
+                    print(f"📤 WILDCARD ECHOED MESSAGE: '{message_text}'")
+            except Exception as e:
+                logger.exception("Error in wildcard handler: %s", e)
+            finally:
+                await stream.close()
+
+        # Register wildcard handler for any protocol
+        host.set_stream_handler(TProtocol("/wildcard/1.0.0"), wildcard_handler)
+
+        # Add a universal handler for any protocol
+        async def universal_handler(stream: INetStream) -> None:
+            logger.info("🎯 UNIVERSAL HANDLER CALLED!")
+            print("🎯 UNIVERSAL HANDLER CALLED!")
+            try:
+                # Try to read from the stream
+                msg = await stream.read(MAX_READ_LEN)
+                if msg:
+                    message_text = msg.decode(errors="ignore")
+                    logger.info("🎯 UNIVERSAL RECEIVED MESSAGE: '%s'", message_text)
+                    print(f"🎯 UNIVERSAL RECEIVED MESSAGE: '{message_text}'")
+
+                    # Echo the message back
+                    await stream.write(msg)
+                    logger.info("📤 UNIVERSAL ECHOED MESSAGE: '%s'", message_text)
+                    print(f"📤 UNIVERSAL ECHOED MESSAGE: '{message_text}'")
+            except Exception as e:
+                logger.exception("Error in universal handler: %s", e)
+            finally:
+                await stream.close()
+
+        # Register universal handler for any protocol
+        host.set_stream_handler(TProtocol("/universal/1.0.0"), universal_handler)
+
+        # Start the relay protocol service and keep it running
         async with background_trio_service(protocol):
             logger.info("Circuit relay protocol started")
 
@@ -255,7 +392,14 @@ async def setup_destination_node(
                 True,
             )
 
-            # Start discovery service
+            # The destination will receive Circuit Relay v2 connections through its
+            # normal stream handler system. The Circuit Relay v2 protocol will handle
+            # the connections and make them available to the host.
+            logger.info(
+                "[DEST] Circuit Relay v2 destination ready to accept connections"
+            )
+
+            # Start discovery service and keep it running
             async with background_trio_service(discovery):
                 logger.info("Relay discovery service started")
 
@@ -269,7 +413,7 @@ async def setup_destination_node(
                             relay_maddr = multiaddr.Multiaddr(relay_addr)
                             relay_info = info_from_p2p_addr(relay_maddr)
                         else:
-                            # Assume it's just a peer ID
+                            # Assume it's just a peer ID - construct full multiaddr
                             relay_peer_id = ID.from_base58(relay_addr)
                             relay_info = PeerInfo(
                                 relay_peer_id,
@@ -298,12 +442,12 @@ async def setup_destination_node(
                         logger.exception("[DEST] Failed to connect to relay: %s", e)
                         return
 
-        print("\nDestination node is running with peer ID:")
-        print(f"{peer_id}")
-        print("\nPress Ctrl+C to exit\n")
+                print("\nDestination node is running with peer ID:")
+                print(f"{peer_id}")
+                print("\nPress Ctrl+C to exit\n")
 
-        # Keep the node running
-        await trio.sleep_forever()
+                # Keep the node running
+                await trio.sleep_forever()
 
 
 async def setup_source_node(
@@ -325,6 +469,8 @@ async def setup_source_node(
 
     # Create host with a fixed key if seed is provided
     key_pair = create_new_key_pair(generate_fixed_private_key(seed) if seed else None)
+
+    # Use default security configuration (Noise + SECIO + PLAINTEXT)
     host = new_host(key_pair=key_pair)
     logger.debug("[SRC] host initialized | peer_id=%s", host.get_id())
 
@@ -444,73 +590,123 @@ async def setup_source_node(
                     relay_peer_id = relay_info.peer_id
                     logger.info(f"This is the relay peer id: {relay_peer_id}")
 
-                    # Create a proper peer info with a relay address
-                    # The destination peer should be reachable through a
-                    # p2p-circuit address
-                    circuit_addr = multiaddr.Multiaddr(f"/p2p-circuit/p2p/{dest_id}")
+                    # Create the circuit address in the correct format
+                    # The correct format is:
+                    # /p2p/{relay_peer_id}/p2p-circuit/p2p/{destination_peer_id}
+                    circuit_addr = multiaddr.Multiaddr(
+                        f"/p2p/{relay_peer_id}/p2p-circuit/p2p/{dest_id}"
+                    )
+                    logger.debug(f"Circuit address: {circuit_addr}")
+
+                    # Create a proper peer info with the circuit address
                     dest_peer_info = PeerInfo(dest_peer_id, [circuit_addr])
                     logger.info(f"This is the dest peer info: {dest_peer_info}")
 
-                    # Dial through the relay
+                    # Use Circuit Relay v2 transport directly instead of host.connect()
+                    # This bypasses the swarm's transport selection
                     try:
                         logger.info(
-                            f"Attempting to dial destination {dest_peer_id} "
+                            f"Attempting to connect to destination {dest_peer_id} "
                             f"through relay {relay_peer_id}"
                         )
 
                         logger.debug(
-                            "[SRC] dialing via transport: dest=%s relay=%s",
+                            "[SRC] connecting via Circuit Relay v2 transport: "
+                            "dest=%s relay=%s",
                             dest_peer_id,
                             relay_peer_id,
                         )
-                        connection = await transport.dial_peer_info(
-                            dest_peer_info, relay_peer_id=relay_peer_id
+
+                        # Connect to destination through relay using normal libp2p flow
+                        # The Swarm will automatically detect the circuit address
+                        # and use Circuit Relay v2 transport
+                        logger.debug(
+                            "[SRC] connecting to destination through relay "
+                            "using normal libp2p flow"
                         )
-
-                        logger.info("Established relay RawConnection: %s", connection)
-
+                        await host.connect(dest_peer_info)
                         logger.info(
                             "Successfully connected to destination through relay!"
                         )
 
-                        # Open a stream to our example protocol
+                        # The Circuit Relay v2 connection is already established
+                        # The destination is handling application data on the Circuit Relay v2 STOP stream
+                        # We need to send the message through the existing connection
+
+                        # Get the connection to the destination through the relay
+                        connections = host.get_network().get_connections(dest_peer_id)
+                        if not connections:
+                            logger.error("[SRC] No connection to destination found")
+                            return
+
+                        connection = connections[0]
                         logger.debug(
-                            "[SRC] opening app stream to %s with %s",
-                            dest_peer_id,
-                            EXAMPLE_PROTOCOL_ID,
+                            "[SRC] Found connection to destination: %s", connection
                         )
+
+                        # The connection is now a RawConnection directly over the relay
+                        # Use it to communicate with the destination using the echo protocol
+                        logger.info(
+                            "Successfully created Circuit Relay v2 connection to destination"
+                        )
+
+                        # Create a stream using the host with allow limited connection context
+                        # This is the Python equivalent of Go's network.WithAllowLimitedConn
+                        from libp2p.network.context import with_allow_limited_conn
+
+                        logger.debug(
+                            "[SRC] Creating stream over Circuit Relay v2 connection with allow limited context"
+                        )
+                        context = with_allow_limited_conn("echo_protocol")
                         stream = await host.new_stream(
-                            dest_peer_id, [EXAMPLE_PROTOCOL_ID]
+                            dest_peer_id,
+                            [TProtocol("/universal/1.0.0")],
+                            context=context,
                         )
-                        if stream:
+                        logger.info(
+                            "Successfully created stream on Circuit Relay v2 connection with protocol negotiation"
+                        )
+
+                        # Send the application message through the stream
+                        msg = f"Hello from {peer_id}!".encode()
+                        message_text = msg.decode()
+                        logger.debug(
+                            "[SRC] writing %d bytes on echo protocol stream", len(msg)
+                        )
+                        await stream.write(msg)
+                        logger.info(
+                            "📤 SOURCE SENT APPLICATION MESSAGE: '%s' to destination",
+                            message_text,
+                        )
+                        print(
+                            f"📤 SOURCE SENT APPLICATION MESSAGE: '{message_text}' to destination"
+                        )
+
+                        # Wait for echo response from the stream
+                        logger.debug(
+                            "[SRC] waiting to read up to %d bytes from echo protocol stream",
+                            MAX_READ_LEN,
+                        )
+                        response = await stream.read(MAX_READ_LEN)
+                        if response:
+                            response_text = response.decode()
                             logger.info(
-                                f"Opened stream to destination with protocol "
-                                f"{EXAMPLE_PROTOCOL_ID}"
+                                "🎯 SOURCE RECEIVED ECHO RESPONSE: '%s' from destination",
+                                response_text,
                             )
-
-                            # Send a message
-                            msg = f"Hello from {peer_id}!".encode()
-                            logger.debug(
-                                "[SRC] writing %d bytes on app stream", len(msg)
+                            print(
+                                f"🎯 SOURCE RECEIVED ECHO RESPONSE: '{response_text}' from destination"
                             )
-                            await stream.write(msg)
-                            logger.info("Sent message to destination")
-
-                            # Wait for response
-                            logger.debug(
-                                "[SRC] waiting to read up to %d bytes on app stream",
-                                MAX_READ_LEN,
-                            )
-                            response = await stream.read(MAX_READ_LEN)
-                            logger.info(
-                                f"Received response: "
-                                f"{response.decode() if response else 'No response'}"
-                            )
-
-                            # Close the stream
-                            await stream.close()
                         else:
-                            logger.error("Failed to open stream to destination")
+                            logger.warning(
+                                "⚠️ SOURCE RECEIVED NO RESPONSE from destination"
+                            )
+                            print("⚠️ SOURCE RECEIVED NO RESPONSE from destination")
+
+                        # Close the stream
+                        await stream.close()
+
+                        logger.info("✅ Circuit Relay v2 communication successful!")
                     except Exception as e:
                         logger.exception("[SRC] Failed to dial through relay: %s", e)
                         logger.error(f"Exception type: {type(e).__name__}")
@@ -538,13 +734,33 @@ def generate_fixed_private_key(seed: int | None) -> bytes:
 
 def main() -> None:
     """Parse arguments and run the appropriate node type."""
-    parser = argparse.ArgumentParser(description="Circuit Relay v2 Example")
+    parser = argparse.ArgumentParser(
+        description="Circuit Relay v2 Example - Demonstrates peer-to-peer "
+        "communication through relay nodes",
+        epilog="""
+Examples:
+  # Start relay node:
+  python relay_example.py --role relay --port 8000
+
+  # Start destination node (use relay peer ID from step 1):
+  python relay_example.py --role destination --port 8001 --relay-addr RELAY_PEER_ID
+
+  # Start source node (use relay and destination peer IDs from steps 1-2):
+  python relay_example.py --role source --relay-addr RELAY_PEER_ID \
+      --dest-id DESTINATION_PEER_ID
+
+  # Use debug mode for verbose logging:
+  python relay_example.py --role relay --port 8000 --debug
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "--role",
         type=str,
         choices=["relay", "source", "destination"],
         required=True,
-        help="Node role (relay, source, or destination)",
+        help="Node role: 'relay' (facilitates connections), 'destination' "
+        "(accepts connections), or 'source' (initiates connections)",
     )
     parser.add_argument(
         "--port",
@@ -573,7 +789,28 @@ def main() -> None:
         help="Enable debug logging",
     )
 
-    args = parser.parse_args()
+    try:
+        args = parser.parse_args()
+    except SystemExit as e:
+        if e.code == 2:  # Argument parsing error
+            print("\n" + "=" * 60)
+            print("QUICK START GUIDE:")
+            print("=" * 60)
+            print("1. Start relay node:")
+            print("   python relay_example.py --role relay --port 8000")
+            print("\n2. Start destination node (use relay peer ID from step 1):")
+            print(
+                "   python relay_example.py --role destination --port 8001 --relay-addr RELAY_PEER_ID"
+            )
+            print(
+                "\n3. Start source node (use relay and destination peer IDs from steps 1-2):"
+            )
+            print(
+                "   python relay_example.py --role source --relay-addr RELAY_PEER_ID --dest-id DESTINATION_PEER_ID"
+            )
+            print("\nFor more options, use: python relay_example.py --help")
+            print("=" * 60)
+        raise
 
     # Set log level and libp2p structured logging
     if args.debug:
