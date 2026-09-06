@@ -118,7 +118,10 @@ async def test_large_scale_fanout():
             )
             assert peers_received >= min_received
 
-            # Cancel all background tasks before exiting
+            # Unsubscribe before cancel so late deliveries cannot schedule
+            # push_msg on a closing Swarm nursery under CI load.
+            for ps in pubsubs:
+                await ps.unsubscribe(topic)
             nursery.cancel_scope.cancel()
 
 
@@ -287,7 +290,10 @@ async def test_simulated_partition():
                     for msg in received_messages[common_topic][i]
                 )
 
-            # Cancel all background tasks before exiting
+            for ps in pubsubs:
+                await ps.unsubscribe(topic_group1)
+                await ps.unsubscribe(topic_group2)
+                await ps.unsubscribe(common_topic)
             nursery.cancel_scope.cancel()
 
 
@@ -398,5 +404,6 @@ async def test_mesh_stability():
                 peers_received >= 3
             )  # At least 75% of peers should receive the message
 
-            # Cancel all background tasks before exiting
+            for ps in pubsubs:
+                await ps.unsubscribe(topic)
             nursery.cancel_scope.cancel()

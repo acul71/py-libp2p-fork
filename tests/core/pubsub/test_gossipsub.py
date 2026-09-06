@@ -729,6 +729,8 @@ async def test_sparse_connect():
                     f"scalability."
                 )
 
+            for pubsub in pubsubs_gsub:
+                await pubsub.unsubscribe(topic)
             nursery.cancel_scope.cancel()
 
 

@@ -255,67 +255,50 @@ async def test_flood_publish_with_high_frequency():
                 await connect(hosts[i], hosts[j])
         await _wait_full_mesh_peers(pubsubs)
 
-        # All peers subscribe to the topic
         topic = "test_flood_publish_high_frequency"
-        received_messages = [[] for _ in range(len(pubsubs))]
+        # Publisher also subscribes so mesh forms symmetrically; receivers keep
+        # subscription handles for delivery waits (avoid background nursery cancel
+        # races that close the Swarm service nursery under CI load).
+        await pubsubs[0].subscribe(topic)
+        subs = []
+        for i in range(1, len(pubsubs)):
+            subs.append(await pubsubs[i].subscribe(topic))
+
+        edges = [
+            (i, j) for i in range(len(pubsubs)) for j in range(i + 1, len(pubsubs))
+        ]
+        await _wait_topic_ready(pubsubs, topic, edges)
+
+        # Publish multiple messages in rapid succession
+        num_messages = 10
+        messages = [f"rapid_message_{i}".encode() for i in range(num_messages)]
+        for message_data in messages:
+            await pubsubs[0].publish(topic, message_data)
+
+        # We don't expect perfect delivery under high load — require >= 70%.
+        min_needed = int(num_messages * 0.7)
+        expected = set(messages)
+
+        async def _wait_peer_enough(sub, peer_index: int) -> None:
+            got: set[bytes] = set()
+            try:
+                with trio.fail_after(10.0):
+                    async for msg in sub:
+                        if msg.data in expected:
+                            got.add(msg.data)
+                            if len(got) >= min_needed:
+                                return
+            except trio.TooSlowError as exc:
+                raise AssertionError(
+                    f"Peer {peer_index} received too few high-frequency messages "
+                    f"(need >= {min_needed}/{num_messages}, got {len(got)})"
+                ) from exc
 
         async with trio.open_nursery() as nursery:
-            # Subscribe all peers to the topic
-            for i in range(len(pubsubs)):
-                subscription = await pubsubs[i].subscribe(topic)
+            for i, sub in enumerate(subs, start=1):
+                nursery.start_soon(_wait_peer_enough, sub, i)
 
-                # Create a task to collect messages
-                async def collect_messages(index, sub):
-                    try:
-                        async for message in sub:
-                            received_messages[index].append(message)
-                    except trio.Cancelled:
-                        pass
-
-                # Start the collection task in the background
-                nursery.start_soon(collect_messages, i, subscription)
-
-            edges = [
-                (i, j) for i in range(len(pubsubs)) for j in range(i + 1, len(pubsubs))
-            ]
-            await _wait_topic_ready(pubsubs, topic, edges)
-
-            # Publish multiple messages in rapid succession
-            num_messages = 10
-            messages = []
-            for i in range(num_messages):
-                message_data = f"rapid_message_{i}".encode()
-                messages.append(message_data)
-                await pubsubs[0].publish(topic, message_data)
-                # No delay between publishes to test high frequency
-
-            # Verify that peers received most of the messages
-            # We don't expect perfect delivery under high load
-            for i in range(1, len(pubsubs)):
-                peer_msgs = received_messages[i]
-                threshold = num_messages * 0.7
-
-                def _enough_received(
-                    msgs: list = peer_msgs,
-                    need: float = threshold,
-                ) -> bool:
-                    return (
-                        sum(
-                            1
-                            for msg_data in messages
-                            if any(msg.data == msg_data for msg in msgs)
-                        )
-                        >= need
-                    )
-
-                await wait_for(
-                    _enough_received,
-                    timeout=10.0,
-                    fail_msg=(
-                        f"Peer {i} received too few high-frequency messages "
-                        f"(need >= {num_messages * 0.7:.0f}/{num_messages})"
-                    ),
-                )
-
-            # Cancel all background tasks before exiting
-            nursery.cancel_scope.cancel()
+        # Stop pubsub delivery before factory teardown so late messages cannot
+        # schedule push_msg on an already-closing Swarm nursery.
+        for ps in pubsubs:
+            await ps.unsubscribe(topic)
